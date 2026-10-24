@@ -12,9 +12,9 @@ const unitRoutes = require('./routes/unitRoutes');
 const productRoutes = require('./routes/productRoutes');
 const customerRoutes = require('./routes/customerRoutes');
 const inventoryRoutes = require('./routes/inventoryRoutes');
-const salesRoutes = require('./routes/salesRoutes');
 const purchaseRoutes = require('./routes/purchaseRoutes');
 const reportRoutes = require('./routes/reportRoutes');
+const salesRoutes = require('./routes/salesRoutes')
 const { errorHandler } = require('./middleware/errorMiddleware');
 
 const app = express();

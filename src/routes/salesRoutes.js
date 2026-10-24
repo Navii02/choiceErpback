@@ -1,56 +1,81 @@
+
 const express = require('express');
-const Product = require('../models/Product');
-const Customer = require('../models/Customer');
-const authMiddleware = require('../middleware/authMiddleware');
-const roleMiddleware = require('../middleware/roleMiddleware');
-const { sendSuccess, sendError } = require('../utils/apiResponse');
 
+const Sale = require('../models/Sale');
+const mongoose = require('mongoose');
 const router = express.Router();
-
-router.use(authMiddleware);
-
-router.get('/', roleMiddleware('super_admin', 'admin', 'cashier', 'accountant'), async (req, res, next) => {
-  try {
-    return sendSuccess(res, 'Sales records retrieved successfully', []);
-  } catch (error) {
-    next(error);
-  }
-});
+const roleMiddleware = require('../middleware/roleMiddleware');
 
 router.post('/pos', roleMiddleware('super_admin', 'admin', 'cashier'), async (req, res, next) => {
+  const session = await mongoose.startSession();
   try {
-    const { items = [], customerId, paymentMethod = 'cash' } = req.body;
+    const {
+      items = [], customerId, paymentMethod = 'cash',
+      clientInvoiceId, deviceId, sequence, createdAt: offlineCreatedAt,
+      allowNegativeStock = false,
+    } = req.body;
 
-    if (!items.length) {
-      return sendError(res, 'At least one product is required for a sale', 400, 'VALIDATION_ERROR');
+    if (!items.length) return sendError(res, 'At least one product is required', 400, 'VALIDATION_ERROR');
+    if (!clientInvoiceId) return sendError(res, 'clientInvoiceId is required for idempotency', 400, 'MISSING_IDEMPOTENCY_KEY');
+
+    // Idempotency: if already applied, return existing
+    const existing = await Sale.findOne({ clientInvoiceId });
+    if (existing) {
+      return sendSuccess(res, 'Sale already recorded (idempotent)', {
+        invoiceNumber: existing.invoiceNumber,
+        clientInvoiceId: existing.clientInvoiceId,
+        total: existing.totals.grandTotal,
+        idempotent: true,
+      });
     }
 
-    let total = 0;
-    for (const item of items) {
-      const product = await Product.findById(item.productId);
-      if (!product) return sendError(res, `Product not found: ${item.productId}`, 404, 'NOT_FOUND');
+    let result;
+    await session.withTransaction(async () => {
+      let subtotal = 0;
+      for (const item of items) {
+        const product = await Product.findById(item.productId).session(session);
+        if (!product) throw Object.assign(new Error(`Product not found: ${item.productId}`), { statusCode: 404 });
 
-      if ((product.stockOnHand || 0) < Number(item.quantity || 0)) {
-        return sendError(res, `Insufficient stock for ${product.name}`, 400, 'INSUFFICIENT_STOCK');
+        const available = product.stockOnHand || 0;
+        if (!allowNegativeStock && available < item.quantity) {
+          throw Object.assign(new Error(`Insufficient stock for ${product.name}`), { statusCode: 400, errorCode: 'INSUFFICIENT_STOCK' });
+        }
+
+        subtotal += Number(product.sellingPrice || 0) * Number(item.quantity);
+        product.stockOnHand = available - Number(item.quantity);
+        await product.save({ session });
       }
 
-      total += Number(product.sellingPrice || 0) * Number(item.quantity || 0);
-      product.stockOnHand = (product.stockOnHand || 0) - Number(item.quantity || 0);
-      await product.save();
-    }
+      const customer = customerId ? await Customer.findById(customerId).session(session) : null;
+      const invoiceNumber = `INV-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    const customer = customerId ? await Customer.findById(customerId) : null;
+      const [sale] = await Sale.create([{
+        clientInvoiceId, deviceId, sequence, invoiceNumber,
+        customer: customer?._id, customerName: customer?.name || 'Walk-in Customer',
+        items: items.map((i) => ({ productId: i.productId, quantity: i.quantity, price: i.price || 0 })),
+        paymentMethod,
+        totals: { subtotal, tax: 0, grandTotal: subtotal },
+        offlineCreatedAt: offlineCreatedAt ? new Date(offlineCreatedAt) : null,
+        createdBy: req.user._id,
+      }], { session });
 
-    return sendSuccess(res, 'POS sale recorded successfully', {
-      invoiceNumber: `INV-${Date.now()}`,
-      customer: customer ? customer.name : 'Walk-in Customer',
-      paymentMethod,
-      total,
-      items,
+      result = sale;
+    });
+
+    return sendSuccess(res, 'POS sale recorded', {
+      invoiceNumber: result.invoiceNumber,
+      clientInvoiceId: result.clientInvoiceId,
+      total: result.totals.grandTotal,
+      idempotent: false,
     }, 201);
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
+  } finally {
+    session.endSession();
   }
 });
-
-module.exports = router;
+router.get('/', roleMiddleware('super_admin', 'admin', 'cashier', 'accountant'), async (req, res, next) => {
+  const sales = await Sale.find().sort({ createdAt: -1 }).limit(500).lean();
+  return sendSuccess(res, 'Sales retrieved', sales);
+});
+module.exports = router;   // ← THE MISSING LINE
